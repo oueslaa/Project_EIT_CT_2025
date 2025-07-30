@@ -1,0 +1,71 @@
+{
+  "duod_live": [
+    "duodenum",
+    "liver"
+  ],
+  "cost_ribL10": [
+    "costal_cartilages",
+    "rib_left_10"
+  ],
+  "autoL_vertL2": [
+    "autochthon_left",
+    "vertebrae_L2"
+  ],
+  "ipsL": [
+    "iliopsoas_left"
+  ],
+  "autoR": [
+    "autochthon_right"
+  ],
+  "ribL12": [
+    "rib_left_12"
+  ],
+  "aort": [
+    "aorta"
+  ],
+  "stom": [
+    "stomach"
+  ],
+  "gall": [
+    "gallbladder"
+  ],
+  "ribR12": [
+    "rib_right_12"
+  ],
+  "ivc": [
+    "inferior_vena_cava"
+  ],
+  "sbow": [
+    "small_bowel"
+  ],
+  "colo": [
+    "colon"
+  ],
+  "kidL": [
+    "kidney_left"
+  ],
+  "ribL11": [
+    "rib_left_11"
+  ],
+  "panc": [
+    "pancreas"
+  ],
+  "vertL1": [
+    "vertebrae_L1"
+  ],
+  "ipsR": [
+    "iliopsoas_right"
+  ],
+  "cord": [
+    "spinal_cord"
+  ],
+  "ribR11": [
+    "rib_right_11"
+  ],
+  "kidR": [
+    "kidney_right"
+  ],
+  "soft": [
+    "soft_tissue"
+  ]
+}

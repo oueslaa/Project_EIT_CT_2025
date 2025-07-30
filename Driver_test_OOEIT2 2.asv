@@ -1,0 +1,91 @@
+%% compare_slices_simple_fixed.m
+% Compare slices par leur conductivité moyenne finie,
+% et affiche les deux meilleures slices avec leur maillage coloré.
+
+clear variables; close all; clc;
+
+%% Paramètres
+meshDir = 'MeshData';
+iz_ref  = 202;
+zvec    = setdiff(201:205, iz_ref);
+nbest   = 2;
+
+%% 1) Référence
+Dref = load(fullfile(meshDir, sprintf('mesh_slice%03d.mat', iz_ref)));
+
+% Supprimer les NaN avant calcul de moyenne
+sig_ref = Dref.sig_old;
+sig_ref = sig_ref(isfinite(sig_ref));
+mean_ref = mean(sig_ref);
+fprintf('Réf slice %d : conductivité moyenne finie = %.4f\n', iz_ref, mean_ref);
+
+%% 2) Boucle sur candidates
+mean_cond = nan(numel(zvec),1);
+conds_nodal = cell(numel(zvec),1);
+
+for k = 1:numel(zvec)
+    iz = zvec(k);
+    Dk = load(fullfile(meshDir, sprintf('mesh_slice%03d.mat', iz)));
+    
+    % Nettoyage NaN
+    sigk = Dk.sig_old;
+    sigk = sigk(isfinite(sigk));
+    mean_cond(k) = mean(sigk);
+    
+    % Interpolation nodale : on fait une constante finie sur chaque nœud
+    % (le plus simple ici)
+    conds_nodal{k} = mean_cond(k) * ones(size(Dk.g_new,1),1);
+    
+    fprintf('Slice %d : conductivité moyenne finie = %.4f\n', iz, mean_cond(k));
+end
+
+%% 3) Erreur absolue
+err_vec = abs(mean_cond - mean_ref);
+
+%% 4) Tracé de l'erreur vs slice
+figure;
+plot(zvec, err_vec, 's-','LineWidth',1.5);
+grid on;
+xlabel('Indice de slice');
+ylabel('|σ_{mean} – σ_{mean}^{réf}|');
+title('Écart de conductivité moyenne');
+
+%% 5) Sélection des meilleures slices
+[~, ids] = mink(err_vec, nbest);
+best_z   = zvec(ids);
+fprintf('Top %d slices par conductivité moyenne : %s\n', nbest, mat2str(best_z));
+
+%% 6) Affichage des maillages colorés
+figure;
+% Définir échelle de couleur globale
+all_vals = vertcat(conds_nodal{:});
+smin = min(all_vals);
+smax = max(all_vals);
+if smin==smax
+    delta = abs(smin)*0.1 + eps;
+    smin = smin - delta;
+    smax = smax + delta;
+end
+
+for j = 1:nbest
+    iz = best_z(j);
+    Dk = load(fullfile(meshDir, sprintf('mesh_slice%03d.mat', iz)));
+    
+    subplot(1, nbest, j);
+    patch( ...
+      'Faces',           Dk.Htri, ...
+      'Vertices',        Dk.g_new, ...
+      'FaceVertexCData', conds_nodal{j}, ...
+      'FaceColor',       'interp', ...
+      'EdgeColor',       'none', ...
+      'FaceAlpha',       0.8 );
+    axis equal tight on;
+    shading interp;
+    colormap(gca, 'jet');
+    caxis([smin smax]);
+    title(sprintf('Slice %03d', iz));
+    xlabel('X (mm)'); ylabel('Y (mm)');
+    colorbar('southoutside');
+end
+
+fprintf('Comparaison terminée.\n');
