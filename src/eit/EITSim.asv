@@ -1,0 +1,573 @@
+classdef EITSim
+    % EITSIM - Full EIT simulation (forward + inverse) on a 2D mesh.
+    % Geometry in mm; convert to meters only for FEM calls.
+
+    properties
+        g; H; triGroup; domain; params
+        Ne; el_width; I_amp; z_contact
+        cond; groups
+        el_centers; E
+        solver
+        sigma_tri; sigma_used
+        Imeas_clean; Imeas
+        sigma_rec
+        sigma_init_used 
+        % [N x 1] carte nodale utilisée comme sigma_init (S/m)
+
+    end
+
+    methods
+        function obj = EITSim(g, H, triGroup, domain, params, E, el_centers)
+            if nargin < 6, E = []; end
+            if nargin < 7, el_centers = []; end
+            obj.g = g; obj.H = H; obj.triGroup = triGroup; obj.domain = domain; obj.params = params;
+            obj.Ne = params.Ne; obj.el_width = params.el_width; obj.I_amp = params.I_amp; obj.z_contact = params.z_contact;
+
+            if isfield(params,'cond')
+                obj.cond = params.cond;
+            else
+                obj.cond = struct('SoftTissue',params.condMap('SoftTissue'), ...
+                                  'Heart',params.condMap('Heart'), 'Lung',params.condMap('Lung'), ...
+                                  'Trachea',params.condMap('Trachea'), 'Bone',params.condMap('Bone'), ...
+                                  'Other',params.condMap('Other'));
+            end
+            if isfield(params,'groups'), obj.groups = params.groups;
+            else, obj.groups = {'SoftTissue','Heart','Lung','Trachea','Bone','Other'}; end
+            if ~isfield(obj.params,'noiseRel'), obj.params.noiseRel = 1e-3; end
+            if ~isfield(obj.params,'rngSeed'),  obj.params.rngSeed  = [];   end
+
+            if ~isempty(E) && ~isempty(el_centers)
+                obj.E = E; obj.el_centers = el_centers;
+            else
+                error('Provide E and el_centers from buildElectrodesFromContour.');
+            end
+
+            assert(size(obj.g,2)==2,'g must be Nx2');
+            assert(all(obj.H(:)>=1)&all(obj.H(:)<=size(obj.g,1)),'H indices out of bounds');
+            assert(numel(obj.triGroup)==size(obj.H,1),'triGroup length mismatch');
+            assert(numel(obj.E)==obj.Ne,'E count mismatch');
+        end
+
+        function c = get_cond(obj,name)
+            assert(isfield(obj.cond,name),'Missing conductivity field');
+            c = obj.cond.(name);
+        end
+
+        function obj = simulate_forward(obj)
+            % sigma per triangle
+            Mtri = size(obj.H,1);
+            st = zeros(Mtri,1);
+            for k=1:numel(obj.groups)
+                idx = (obj.triGroup==k);
+                gname = obj.groups{k};
+                if isfield(obj.cond,gname), st(idx) = obj.cond.(gname);
+                else, st(idx) = obj.cond.SoftTissue; end
+            end
+            obj.sigma_tri = st;
+
+            % FEM (convert mm->m)
+            g_m = obj.g * 1e-3;
+            mesh = ForwardMesh1st(g_m, obj.H, obj.E);
+            solver = EITFEM(mesh);
+            solver.zeta = obj.z_contact*ones(obj.Ne,1);
+            solver.mode = 'current';
+
+            % Current pattern
+            injPattern = EITSim.buildTrigPattern(obj.Ne, obj.I_amp);
+            solver.Iel = injPattern(:);
+
+            % Forward
+            obj.solver = solver;
+            obj.sigma_used  = obj.sigma_tri;        % triangle-wise (fast)
+            obj.Imeas_clean = solver.SolveForwardVec(obj.sigma_tri);
+
+            % Noise
+            if ~isempty(obj.params.rngSeed), rng(obj.params.rngSeed); end
+            noise = obj.params.noiseRel * max(abs(obj.Imeas_clean)) * randn(size(obj.Imeas_clean));
+            obj.Imeas = obj.Imeas_clean + noise;
+        end
+
+
+function obj = simulate_inverse(obj, sig_init, doPlots, reg)
+% simulate_inverse(sig_init, doPlots, reg)
+% - sig_init : [Nnodes x 1] ou [Ntri x 1], S/m
+% - doPlots  : bool (affichages internes du GN)
+% - reg      : struct('tik_weight',..,'W',..) pour la régularisation sur p
+%
+% NOTE: ne touche pas OOEIT-main. On wrappe le forward via OfunDataMisfitROI.
+
+    % ---------- Défauts ----------
+    if nargin < 2 || isempty(sig_init)
+        sig_init = ones(size(obj.g,1),1) * obj.get_cond('SoftTissue');
+    end
+    if nargin < 3 || isempty(doPlots), doPlots = false; end
+    if nargin < 4, reg = struct(); end
+
+    % ---------- utilitaires node<->tri ----------
+    function tri = node2tri_avg(H, nod)
+        nod = nod(:); Mt = size(H,1);
+        tri = (nod(H(:,1)) + nod(H(:,2)) + nod(H(:,3))) / 3;
+        tri = tri(:);
+    end
+    function nod = tri2node_avg(H, tri, N)
+        tri = tri(:); Mt=size(H,1);
+        if numel(tri) ~= Mt
+            if mod(numel(tri),Mt)==0
+                tri = mean(reshape(tri,[],Mt).',2);
+            else
+                tri = tri(1:Mt);
+            end
+        end
+        nod = zeros(N,1); cnt = zeros(N,1);
+        for t=1:Mt
+            v = H(t,:);
+            nod(v) = nod(v) + tri(t);
+            cnt(v) = cnt(v) + 1;
+        end
+        idx = cnt>0; nod(idx) = nod(idx)./cnt(idx);
+    end
+
+    % ---------- mise en "tri" ----------
+    N  = size(obj.g,1);
+    Mt = size(obj.H,1);
+    if numel(sig_init)==N
+        sig0_tri = node2tri_avg(obj.H, sig_init);
+    elseif numel(sig_init)==Mt
+        sig0_tri = sig_init(:);
+    else
+        sig0_tri = ones(Mt,1) * obj.get_cond('SoftTissue');
+    end
+    obj.sigma_init_used = sig_init(:);
+
+    % ---------- forward de référence & mesures ----------
+    U0 = obj.solver.SolveForwardVec(sig0_tri); U0 = U0(:);
+
+    if isempty(obj.Imeas)
+        error('simulate_inverse: Imeas is empty. Provide measurement vector to EITSim before inversion.');
+    end
+    y  = obj.Imeas(:);
+
+    % rééchantillonnage si tailles diffèrent
+    mU = numel(U0);
+    if numel(y) ~= mU
+        if numel(y) > mU
+            y = y(1:mU);
+        else
+            k = ceil(mU/numel(y));
+            y = repmat(y, k, 1); y = y(1:mU);
+        end
+    end
+
+    % ---------- alignement affine (y ≈ a*U0 + b) ----------
+    A  = [U0, ones(mU,1)];
+    ab = A \ y;    a = ab(1); b = ab(2);
+    y_aligned = (y - b) / max(a, eps);
+    fprintf('[Align] a=%.6g  b=%.6g  ||Imeas-U||=%.6g  ->  ||(Imeas-b)/a - U||=%.6g\n', ...
+        a, b, norm(y-U0), norm(y_aligned-U0));
+    y = y_aligned;
+
+    % ---------- pondération L ----------
+    if isfield(obj.params,'noiseRel') && ~isempty(obj.params.noiseRel)
+        L = speye(mU) * (1/max(obj.params.noiseRel, eps));
+    else
+        L = speye(mU);
+    end
+
+    % ---------- mapping TRI -> GROUPES (1..K) ----------
+    groupIdx = ones(Mt,1);
+    if isstruct(obj.triGroup)
+        flds = fieldnames(obj.triGroup);
+        for k = 1:numel(flds)
+            idx = obj.triGroup.(flds{k});
+            idx = idx(idx>=1 & idx<=Mt);
+            groupIdx(idx) = k;
+        end
+    elseif isnumeric(obj.triGroup) && numel(obj.triGroup)==Mt
+        [~,~,groupIdx] = unique(obj.triGroup(:),'stable');
+    end
+    K = max(groupIdx);
+
+    % ---------- p0 = moyenne par groupe ----------
+    if numel(sig_init)==N, sig0_for_p = node2tri_avg(obj.H, sig_init);
+    else,                  sig0_for_p = sig0_tri;
+    end
+    p0 = zeros(K,1);
+    for k=1:K
+        sk = sig0_for_p(groupIdx==k);
+        p0(k) = iff(isempty(sk), obj.get_cond('SoftTissue'), mean(sk));
+    end
+
+    % bornes "soft" pour éviter les envolées si Hessienne mal conditionnée
+    % (ajuste si tu as un autre atlas de valeurs)
+    lb_default = 0.02;  % S/m
+    ub_default = 1.50;  % S/m
+    p0 = max(min(p0, ub_default), lb_default);
+
+    % ---------- régularisation ----------
+    if ~isfield(reg,'tik_weight') || isempty(reg.tik_weight)
+        reg.tik_weight = 1e-2;     % >0 pour stabiliser J'J
+    end
+    reg.p0 = p0;
+    if ~isfield(reg,'W') || isempty(reg.W)
+        reg.W = speye(K);
+    else
+        if isscalar(reg.W), reg.W = reg.W * speye(K); end
+        if ~isequal(size(reg.W),[K K]), reg.W = speye(K); end
+    end
+
+    % ---------- construit l'ofun ROI ----------
+    % (ne tente PAS d'injecter y dans le solver; l'ofun s'en occupe)
+    ofun = OfunDataMisfitROI(obj.solver, obj.H, groupIdx, y, L, reg);
+
+    % ---------- configure GN ----------
+    invSolver = SolverGN({ofun});
+    invSolver.plotLinesearch   = double(!!doPlots);
+    invSolver.plotIterations   = double(!!doPlots);
+    invSolver.plotData         = double(!!doPlots);
+    invSolver.plotConvergence  = double(!!doPlots);
+    invSolver.plotUQ           = 0;          % <- important pour éviter []
+    invSolver.outputFunVals    = 1;
+    invSolver.maxIter          = 30;
+    invSolver.maxIterInLine    = 15;
+    invSolver.alwaysMove       = 1;
+    invSolver.parabolic        = 1;
+    invSolver.useLastDist      = 1;
+    invSolver.eRel             = 1e-5;
+    invSolver.eStep            = 1e-8;
+    invSolver.eStop            = 1e-2;
+    invSolver.hLinesearch      = [];
+    invSolver.hConvergence     = [];
+    invSolver.hData            = [];
+    invSolver.plotter          = [];
+
+    % ---------- solve sur p, puis remonte σ ----------
+    p_rec      = invSolver.Solve(p0);
+    p_rec      = max(min(p_rec, ub_default), lb_default);     % clamp final
+    sig_tri    = p_rec(groupIdx);
+    sig_nodes  = tri2node_avg(obj.H, sig_tri, N);
+
+    obj.sigma_rec  = sig_nodes(:);
+    obj.sigma_used = sig_tri(:);
+end
+
+function y = iff(c,a,b), if c, y=a; else, y=b; end
+
+
+
+
+function plot_all(obj, exportBase, mode, opts)
+    % plot_all(exportBase, mode, opts)
+    % - exportBase: dossier cible. [] => figures visibles (pas d'export).
+    % - mode: 'neurological' (defaut) ou 'radiological'
+    % - opts: struct('dpi',300,'pdf',true,'svg',false,'fig',false,'mode',mode)
+
+    % Tolérance d'appel: plot_all('neurological') => pas d'export, juste le mode
+    if nargin >= 2 && (ischar(exportBase) || isstring(exportBase)) ...
+            && (nargin < 3 || isempty(mode)) ...
+            && any(strcmpi(string(exportBase), ["neurological","radiological"]))
+        mode = char(exportBase);
+        exportBase = [];
+    end
+    if nargin < 2, exportBase = []; end
+    if nargin < 3 || isempty(mode), mode = 'neurological'; end
+    if nargin < 4 || isempty(opts)
+        opts = struct('dpi',300,'pdf',true,'svg',false,'fig',false,'mode',mode);
+    else
+        if ~isfield(opts,'dpi'),  opts.dpi  = 300; end
+        if ~isfield(opts,'pdf'),  opts.pdf  = true; end
+        if ~isfield(opts,'svg'),  opts.svg  = false; end
+        if ~isfield(opts,'fig'),  opts.fig  = false; end
+        opts.mode = mode;
+    end
+
+    showFigures = isempty(exportBase);
+
+    % ⚠️ ICI: plus de "end, end" sur la même ligne
+    vis = 'on';
+    if ~showFigures
+        vis = 'off';
+        if isstring(exportBase), exportBase = char(exportBase); end
+        if ~exist(exportBase,'dir')
+            mkdir(exportBase);
+        end
+    end
+    % ... (le reste de ta fonction inchangé)
+end
+
+    % ---- Normalisation/exportBase (évite exist() sur une valeur non chaîne) ----
+    if isempty(exportBase)
+        exportBase = "";
+    elseif ~(ischar(exportBase) || isstring(exportBase))
+        warning('plot_all:exportBaseType', ...
+            'exportBase doit être une chaîne. Fallback vers ./exports');
+        exportBase = fullfile(pwd,'exports');
+    end
+    exportBase  = char(string(exportBase));          % assure un char
+    showFigures = (strlength(string(exportBase))==0);
+    if showFigures
+        vis = 'on';
+    else
+        vis = 'off';
+        if ~exist(exportBase,'dir'), mkdir(exportBase); end
+    end
+
+    % -- helper d'export
+    function do_export(fig, name)
+        if showFigures, drawnow; return; end
+        out_noext = fullfile(exportBase, name);
+        outdir = fileparts(out_noext);
+        if ~exist(outdir,'dir'), mkdir(outdir); end
+        if exist('save_plot','file')
+            save_plot(fig, out_noext, opts);
+        else
+            exportgraphics(fig, [out_noext '.png'], 'Resolution', opts.dpi, 'BackgroundColor','white');
+            if opts.pdf
+                exportgraphics(fig, [out_noext '.pdf'], 'ContentType','vector', 'BackgroundColor','white');
+            end
+            if opts.fig, savefig(fig, [out_noext '.fig']); end
+        end
+        close(fig);
+    end
+
+    % -- helper d'affichage : accepte nodal (N) ou triangulaire (M)
+    function draw_field(ax, H, g, C)
+        N = size(g,1); M = size(H,1); C = C(:);
+        if numel(C) == N
+            patch('Faces',H,'Vertices',g,'FaceVertexCData',C, ...
+                  'FaceColor','interp','EdgeColor',[0.75 0.75 0.75],'EdgeAlpha',0.35,'Parent',ax);
+        elseif numel(C) == M
+            patch('Faces',H,'Vertices',g,'FaceVertexCData',C, ...
+                  'FaceColor','flat','EdgeColor',[0.75 0.75 0.75],'EdgeAlpha',0.35,'Parent',ax);
+        else
+            % Conversion simple tri->noeud si tailles incohérentes
+            warning('plot_all: converting to nodal by averaging (size=%d, N=%d, M=%d).', numel(C), N, M);
+            Cnod = tri2node_avg(H, C, N);
+            patch('Faces',H,'Vertices',g,'FaceVertexCData',Cnod, ...
+                  'FaceColor','interp','EdgeColor',[0.75 0.75 0.75],'EdgeAlpha',0.35,'Parent',ax);
+        end
+    end
+
+    %% 1) Mesh + électrodes
+    fig = figure('Name','Mesh + electrodes','Color','w','Visible',vis);
+    ax  = axes('Parent',fig); hold(ax,'on'); axis(ax,'equal');
+    triplot(obj.H, obj.g(:,1), obj.g(:,2), 'Color', [0.8 0.8 0.8]);
+
+    % Domaine
+    try
+        [bx,by] = boundary(obj.domain); plot(ax, bx, by, 'r-', 'LineWidth', 1.8);
+    catch
+        try
+            P = obj.domain.Vertices; P = [P; P(1,:)]; plot(ax, P(:,1), P(:,2), 'r-', 'LineWidth', 1.8);
+        catch
+            % silencieux si pas de frontière exploitable
+        end
+    end
+
+    % Électrodes
+    if isprop(obj,'E') && ~isempty(obj.E)
+        if isprop(obj,'Ne') && ~isempty(obj.Ne), Ne = obj.Ne; else, Ne = numel(obj.E); end
+        for k = 1:Ne
+            Ek = obj.E{k};
+            for e = 1:size(Ek,1)
+                plot(ax, obj.g(Ek(e,:),1), obj.g(Ek(e,:),2), '-', 'Color', [0.2 0.2 1], 'LineWidth', 2.5);
+            end
+        end
+    end
+    if isprop(obj,'el_centers') && ~isempty(obj.el_centers)
+        scatter(ax, obj.el_centers(:,1), obj.el_centers(:,2), 60, 'b', 'filled');
+    end
+    set(ax,'XTick',[],'YTick',[]); box(ax,'on');
+    title(ax,'Mesh + electrodes','Interpreter','none');
+    try, hide_axes_toolbar(ax); end %#ok<TRYNC>
+    try, apply_display_convention(ax, mode); end %#ok<TRYNC>
+    do_export(fig, 'mesh_electrodes');
+
+    %% 2) sigma (forward)
+    fig = figure('Name','sigma (forward)','Color','w','Visible',vis);
+    ax  = axes('Parent',fig); hold(ax,'on');
+
+    % Carte forward robuste
+    sigFwd = []; Mt = size(obj.H,1);
+    if isprop(obj,'sigma_tri') && ~isempty(obj.sigma_tri) && numel(obj.sigma_tri)==Mt
+        sigFwd = obj.sigma_tri(:);
+    elseif ismethod(obj,'sigma_tri_from_groups')
+        sigFwd = obj.sigma_tri_from_groups();
+    else
+        % Fallback depuis triGroup/cond
+        sigFwd = ones(Mt,1) * obj.get_cond('SoftTissue');
+        if isprop(obj,'triGroup') && ~isempty(obj.triGroup)
+            if isstruct(obj.triGroup)
+                flds = fieldnames(obj.triGroup);
+                for kk = 1:numel(flds)
+                    name = flds{kk};
+                    idx  = obj.triGroup.(name);
+                    idx  = idx(idx>=1 & idx<=Mt);
+                    if isfield(obj.cond,name), sigFwd(idx) = obj.cond.(name); end
+                end
+            elseif isnumeric(obj.triGroup) && numel(obj.triGroup)==Mt
+                [~,~,lab] = unique(obj.triGroup(:),'stable');
+                if isprop(obj,'groups') && ~isempty(obj.groups)
+                    for kk = 1:numel(obj.groups)
+                        name = obj.groups{kk};
+                        if isfield(obj.cond,name), sigFwd(lab==kk) = obj.cond.(name); end
+                    end
+                end
+            end
+        end
+    end
+
+    draw_field(ax, obj.H, obj.g, sigFwd);
+    axis(ax,'equal'); axis(ax,'tight'); colormap(ax, jet);
+    cb = colorbar(ax); ylabel(cb,'S/m');
+    title(ax,'\sigma (forward)','Interpreter','tex'); set(ax,'XTick',[],'YTick',[]);
+    try, hide_axes_toolbar(ax); end %#ok<TRYNC>
+    try, apply_display_convention(ax, mode); end %#ok<TRYNC>
+    do_export(fig, 'sigma_forward');
+
+    %% 3) sigma_init (inverse)
+    if isprop(obj,'sigma_init_used') && ~isempty(obj.sigma_init_used)
+        sig0 = obj.sigma_init_used;
+    else
+        sig0 = ones(size(obj.g,1),1) * obj.get_cond('SoftTissue');
+    end
+    fig = figure('Name','sigma_init','Color','w','Visible',vis); ax=axes('Parent',fig); hold(ax,'on');
+    draw_field(ax, obj.H, obj.g, sig0);
+    axis(ax,'equal'); axis(ax,'tight'); colormap(ax, jet); cb=colorbar(ax); ylabel(cb,'S/m');
+    title(ax,'\sigma_{init} (inverse)','Interpreter','tex'); set(ax,'XTick',[],'YTick',[]);
+    try, hide_axes_toolbar(ax); end %#ok<TRYNC>
+    try, apply_display_convention(ax, mode); end %#ok<TRYNC>
+    do_export(fig, 'sigma_init');
+
+    %% 4) Reconstruction
+    fig = figure('Name','Reconstruction','Color','w','Visible',vis); ax=axes('Parent',fig); hold(ax,'on');
+    draw_field(ax, obj.H, obj.g, obj.sigma_rec);
+    axis(ax,'equal'); axis(ax,'tight'); colormap(ax, jet); cb=colorbar(ax); ylabel(cb,'S/m');
+    title(ax,'Conductivity (reconstructed)','Interpreter','none');
+    try, hide_axes_toolbar(ax); end %#ok<TRYNC>
+    try, apply_display_convention(ax, mode); end %#ok<TRYNC>
+    do_export(fig, 'reconstruction');
+
+    %% 5) Signaux
+    fig = figure('Name','Signals','Color','w','Visible',vis); ax=axes('Parent',fig);
+    if isprop(obj,'Imeas') && ~isempty(obj.Imeas)
+        plot(ax, obj.Imeas, '-o', 'LineWidth', 1.2);
+    else
+        plot(ax, 1, 0, '.'); text(ax, 0.5, 0.5, 'Imeas vide', 'Units','normalized','HorizontalAlignment','center');
+    end
+    grid(ax,'on'); xlabel(ax,'Measurement index'); ylabel(ax,'Voltage [V]'); title(ax,'Simulated signals','Interpreter','none');
+    do_export(fig, 'signals');
+
+    % --- helper local tri->noeud (moyenne simple) ---
+    function nodal = tri2node_avg(H, triVals, N)
+        triVals = triVals(:);
+        if numel(triVals) ~= size(H,1)
+            if mod(numel(triVals), size(H,1)) == 0
+                triVals = mean(reshape(triVals, [], size(H,1))', 2);
+            else
+                triVals = triVals(1:size(H,1));
+            end
+        end
+        nodal = zeros(N,1); cnt = zeros(N,1);
+        for t = 1:size(H,1)
+            v = H(t,:);
+            nodal(v) = nodal(v) + triVals(t);
+            cnt(v)   = cnt(v) + 1;
+        end
+        idx = cnt > 0; nodal(idx) = nodal(idx) ./ cnt(idx);
+    end
+end
+
+
+    function out = ternary(cond, a, b)
+        if cond, out = a; else, out = b; end
+    end
+
+
+        function save_results(obj, outdir)
+            if nargin < 2 || isempty(outdir), outdir = 'Outputs'; end
+            if ~exist(outdir,'dir'), mkdir(outdir); end
+            S = struct();
+            S.g=obj.g; S.H=obj.H; S.triGroup=obj.triGroup; S.domain=obj.domain; S.params=obj.params;
+            S.Ne=obj.Ne; S.el_width=obj.el_width; S.I_amp=obj.I_amp; S.z_contact=obj.z_contact;
+            S.cond=obj.cond; S.groups=obj.groups; S.el_centers=obj.el_centers; S.E=obj.E;
+            S.sigma_tri=obj.sigma_tri; S.sigma_used=obj.sigma_used; S.Imeas_clean=obj.Imeas_clean;
+            S.Imeas=obj.Imeas; S.sigma_rec=obj.sigma_rec;
+            save(fullfile(outdir,'eit_results.mat'),'-struct','S','-v7.3');
+            fprintf('[EITSim] Results saved: %s\n', fullfile(outdir,'eit_results.mat'));
+        end
+        function Ctri = sigma_tri_from_groups(obj)
+            % Fallback: construit la sigma triangulaire à partir de triGroup+cond
+            M = size(obj.H,1);
+            Ctri = zeros(M,1);
+            for k = 1:numel(obj.groups)
+                name = obj.groups{k};
+                idx  = (obj.triGroup == k);
+                if isfield(obj.cond,name)
+                    Ctri(idx) = obj.cond.(name);
+                else
+                    Ctri(idx) = obj.cond.SoftTissue;
+                end
+            end
+        end
+    end
+
+
+    methods(Static)
+        function injPattern = buildTrigPattern(Ne, I_amp)
+            injPattern = zeros(Ne, Ne);
+            for k = 1:Ne
+                phase = 2*pi*(k-1)/Ne;
+                for n = 1:Ne
+                    injPattern(n,k) = I_amp * sin( 2*pi*(n-1)/Ne + phase );
+                end
+            end
+        end
+        function [E,w] = make_tv_weights(H, triGroup, w_intra, w_cross)
+        % Renvoie la liste d'arêtes uniques E [Ne x 2] et un poids par arête
+        % (w_intra si les deux nœuds sont dans le même organe, sinon w_cross).
+        E = sort([H(:,[1 2]); H(:,[2 3]); H(:,[1 3])], 2);
+        E = unique(E,'rows');
+        N = max(H(:));
+        % organe majoritaire pour chaque nœud (à partir des triangles adjacents)
+        adj = cell(N,1);
+        for t = 1:size(H,1)
+            v = H(t,:);
+            adj{v(1)}(end+1) = t;
+            adj{v(2)}(end+1) = t;
+            adj{v(3)}(end+1) = t;
+        end
+        nodeOrg = zeros(N,1);
+        for i=1:N
+            nodeOrg(i) = mode(triGroup(adj{i}));
+        end
+        same = nodeOrg(E(:,1)) == nodeOrg(E(:,2));
+        w = w_cross*ones(size(E,1),1);
+        w(same) = w_intra;
+        end
+        
+        function L = organ_laplacian(H, triGroup, N)
+        % Laplacien bloc-diagonal : lisse à l'intérieur de chaque organe
+        E = sort([H(:,[1 2]); H(:,[2 3]); H(:,[1 3])], 2);
+        E = unique(E,'rows');
+        % organe par nœud
+        adj = cell(N,1);
+        for t=1:size(H,1)
+            v = H(t,:); adj{v(1)}(end+1)=t; adj{v(2)}(end+1)=t; adj{v(3)}(end+1)=t;
+        end
+        nodeOrg = zeros(N,1);
+        for i=1:N, nodeOrg(i) = mode(triGroup(adj{i})); end
+        % assemble
+        I = []; J = []; V = [];
+        for e=1:size(E,1)
+            a = E(e,1); b = E(e,2);
+            if nodeOrg(a) ~= nodeOrg(b), continue; end   % ignore bords d'organe
+            I = [I a a b b]; %#ok<AGROW>
+            J = [J a b a b]; %#ok<AGROW>
+            V = [V 1 -1 -1 1]; %#ok<AGROW>
+        end
+        L = sparse(I,J,V,N,N);
+        end
+
+
+    end
+end

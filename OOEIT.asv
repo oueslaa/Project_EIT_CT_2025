@@ -1,0 +1,192 @@
+% Script : mesh_label_phys_conductivity_eit.m
+% Attribution labels d'organes et conductivités physiques (offset physique NIfTI, flip Y)
+
+clear; clc;
+
+% === PARAMÈTRES ===
+meshDir = 'MeshData';
+maskDir = 'segmentation_slices';
+mapFile = 'group_colors.mat';
+nii_mask_path = '/Users/anis/Documents/StageInria/Code/Project_EIT_CT_2025-main/merged_masks/soft_mask_z301_310.nii.gz';
+z_min = 301;   % Adapter si besoin
+z_max = 310;
+
+% --- Récupère info physique du NIfTI (offset, scaling) ---
+info_mask = niftiinfo(nii_mask_path);
+dx = info_mask.PixelDimensions(1);
+dy = info_mask.PixelDimensions(2);
+affine_mask = info_mask.Transform.T;
+x_phys0 = affine_mask(4,1); % origine physique X (mm)
+y_phys0 = affine_mask(4,2); % origine physique Y (mm)
+disp(['dx = ', num2str(dx), ', dy = ', num2str(dy)]);
+disp(['Offset physique (mm): x0 = ', num2str(x_phys0), ', y0 = ', num2str(y_phys0)]);
+
+% --- Mapping groupe <-> couleur ---
+Smap = load(mapFile);   % group_names, rgb_colors
+group_names = string(Smap.group_names);
+group_names_trimmed = strtrim(group_names);
+rgb_colors  = Smap.rgb_colors;
+
+% --- Attribution auto conductivité (ajuster mots-clés/valeurs si besoin) ---
+val_soft  = 0.3;
+val_heart = 0.5;
+val_lung  = 0.15;
+val_bone  = 0.05;
+key_soft  = "soft";
+key_heart = "heart";
+key_lung  = "lung";
+key_bone  = ["rib", "cost", "scap", "vert", "spin"];
+
+conductivities = zeros(numel(group_names_trimmed),1);
+for i = 1:numel(group_names_trimmed)
+    name = lower(group_names_trimmed(i));
+    if contains(name, key_soft)
+        conductivities(i) = val_soft;
+    elseif contains(name, key_heart)
+        conductivities(i) = val_heart;
+    elseif contains(name, key_lung)
+        conductivities(i) = val_lung;
+    elseif any(contains(name, key_bone))
+        conductivities(i) = val_bone;
+    else
+        conductivities(i) = val_soft;
+    end
+end
+conductivity_map = containers.Map(cellstr(group_names_trimmed), num2cell(conductivities));
+
+% --- Attribution des labels organes et conductivités ---
+meshFiles = dir(fullfile(meshDir, 'mesh_slice*.mat'));
+fprintf('Found %d mesh files.\n', numel(meshFiles));
+
+for fi = 1:numel(meshFiles)
+    fstr = meshFiles(fi).name;
+    expr = 'mesh_slice(\d+).mat';
+    sliceTokens = regexp(fstr, expr, 'tokens', 'once');
+    if isempty(sliceTokens)
+        warning('Fichier non conforme : %s. Skip.', fstr); continue;
+    end
+    sliceNum = str2double(sliceTokens{1});
+    if sliceNum < z_min || sliceNum > z_max
+        fprintf('Slice %d hors plage [%d-%d]. Skip.\n', sliceNum, z_min, z_max);
+        continue
+    end
+
+    S = load(fullfile(meshDir, fstr));
+    g = S.g; H = S.H;
+
+    % --- Image segmentée de la slice ---
+    mask_file = fullfile(maskDir, sprintf('segmented_slice_%03d.png', sliceNum));
+    if ~exist(mask_file, 'file')
+        warning('Mask de segmentation %s non trouvé. Skip.', mask_file); continue;
+    end
+    img = imread(mask_file);   % uint8 [h w 4]
+    if size(img,3) < 3
+        error('L''image segmentée ne contient pas de couleurs RGB.');
+    end
+    img = im2double(img(:,:,1:3));   % [0,1]
+    [ny, nx, ~] = size(img);
+
+%faire par triangle (conductivité constante dans chaque 
+
+    % --- Barycentre de chaque triangle en (mm) ---
+    nTriangles = size(H,1);
+    bary = (g(H(:,1),:) + g(H(:,2),:) + g(H(:,3),:)) / 3; % [M x 2] en mm
+
+    % --- Conversion barycentre mesh -> indices pixel (offset + flip Y) ---
+    ix = round((bary(:,1) - min(g(:,1))) / dx) + 1;
+    iy = round((bary(:,2) - min(g(:,2))) / dy) + 1;
+    ix = min(max(ix,1), nx);
+    iy = min(max(iy,1), ny);
+    iy_flip = ny - iy + 1;
+
+
+    % --- Attribution du label organe (par couleur la plus proche) ---
+    organs = zeros(nTriangles,1);   % Indice dans group_names_trimmed
+    for t = 1:nTriangles
+        color_px = squeeze(img(iy_flip(t), ix(t), :))';
+        dists = sum((rgb_colors - color_px).^2, 2);
+        [~, idx_grp] = min(dists);
+        organs(t) = idx_grp;
+    end
+
+    tab = tabulate(organs);
+disp(tab);
+% Ou plus verbeux :
+for idx = unique(organs(:))'
+    org_name = group_names_trimmed(idx);
+    fprintf('%s : %d triangles\n', org_name, sum(organs==idx));
+end
+
+
+    % --- Sauvegarde le mesh enrichi ---
+    save(fullfile(meshDir, fstr), '-append', 'organs');
+    fprintf('Ajouté labels organs pour %s (slice %d)\n', fstr, sliceNum);
+
+    % === 2. Attribution conductivité physique à chaque triangle ===
+    sig_tri = zeros(nTriangles,1);
+    for t = 1:nTriangles
+        label_idx = organs(t);
+        org_name = group_names_trimmed(label_idx);
+        sig_tri(t) = conductivity_map(org_name);
+    end
+
+    % --- Interpolation nodale (par nœud) ---
+    nNodes = size(g,1);
+    sig_nod = zeros(nNodes,1);
+    adj = cell(nNodes,1);
+    for t = 1:size(H,1)
+        for k = 1:3
+            adj{H(t,k)}(end+1) = t;
+        end
+    end
+    for n = 1:nNodes
+        tri_idx = adj{n};
+        if isempty(tri_idx)
+            sig_nod(n) = val_soft;
+        else
+            sig_nod(n) = mean(sig_tri(tri_idx));
+        end
+    end
+
+    % === 3. Forward solve (OOEIT) ===
+% === 3. Forward solve (OOEIT) ===
+g_m = g / 1000; % mm → m
+
+% --- Ajout récupération des électrodes ---
+if isfield(S, 'elfaces')
+    elfaces = S.elfaces;
+else
+    elfaces = [];
+end
+
+mesh = ForwardMesh1st(g_m, H, elfaces);
+solver = EITFEM(mesh);
+solver.mode = 'potential';
+
+
+    fprintf('\n=== Slice %s ===\n', meshFiles(fi).name);
+    fprintf('Triangles: %d, Noeuds: %d\n', nTriangles, nNodes);
+    disp('Conductivités utilisées (S/m):');
+    for idx = unique(organs(:))'
+        org_name = group_names_trimmed(idx);
+        fprintf('  %s : %.2f\n', org_name, conductivity_map(org_name));
+    end
+
+    tic;
+    Imeas = solver.SolveForwardVec(sig_nod);
+    elapsed = toc;
+    fprintf('Temps forward solve: %.3f secondes.\n', elapsed);
+
+    % --- Visualisation (optionnel) ---
+    figure;
+    patch('Faces',H,'Vertices',g_m,'FaceVertexCData',sig_nod, ...
+        'FaceColor','interp','EdgeAlpha',0.2,'FaceAlpha',1);
+    axis equal tight; colorbar; colormap parula;
+    title(sprintf('Conductivité physique nodale (slice %s)', meshFiles(fi).name), 'Interpreter','none');
+    xlabel('X (m)'); ylabel('Y (m)');
+
+    % --- Sauvegarde des résultats ---
+    save(fullfile(meshDir, ['solve_stats_' meshFiles(fi).name]), 'elapsed', 'sig_nod', 'Imeas', 'H', 'g_m', 'organs');
+end
+
+disp('--- Terminé ---');
