@@ -1,163 +1,124 @@
 % ============================
 % File: Problem_Inverse.m
 % ============================
-% RECONSTRUCTION EIT (problème inverse) — batch only
-% -------------------------------------------------------------------------
-% OBJECTIF
-%   Lancer une reconstruction inverse EIT sur UNE slice CT en s'appuyant
-%   sur les fichiers produits par Problem_Foward.m :
-%     - Paramétrisation au choix : θ par TRIANGLE (recommandé) ou σ NODALE
-%     - Pipeline simple : 0..N pas NOSER puis 0..M itérations GN
-%     - Sauvegarde d'un pack unique + snapshots d'itération
-%
-% SORTIES (arborescence cible)
-%   Outputs/<patient_this>/slice_<ZZZ>/inverse/prev_<patientPrev>_<PPP>/
-%       ├─ reconstruction_inverse.mat   % struct 'rec' (résultats)
-%       └─ plots_inverse/iterations/iter_###.mat  % snapshots nodal/tri par itération
-%
-% PRÉREQUIS
-%   - Avoir déjà exécuté Problem_Foward.m pour la slice cible (pack forward
-%     et mesh présents dans Outputs/<patient_this>/slice_<ZZZ>).
-%   - OOEIT (ForwardMesh1st, EITFEM, …) accessible dans le path.
-%   - src/ contient simulate_inverse_slice.m et ses dépendances.
-%
-% CONSEILS / PIÈGES
-%   - INIT_MODE='morpho' nécessite un couple (patient_prev,slice_prev) valide
-%     ayant un pack/mesh forward existant (même patient recommandé).
-%   - BEST_MU et BEST_ALPHA sont des points de départ "raisonnables".
-%     Ajuster si divergence/stagnation (voir misfit et snapshots).
-%   - Aucune figure ne s'affiche ici (plots dans un autre script si besoin).
-% -------------------------------------------------------------------------
+% RECONSTRUCTION EIT (inverse problem) — slice unique
+%   - Transplante les organes de slice_prev dans le contour ext. de slice_this
+%   - Construit un maillage INVERSE propre (contour seul)
+%   - Crée une init σ0 structurée (discrète) depuis les polygones (pas constante)
+%   - Lance NOSER/GN sur le maillage inverse (découplé du forward)
 
 clear; close all; clc;
-addpath('src', genpath('src'));
-addpath(genpath('/Users/anis/Documents/StageInria/Code/OOEIT-main'));  % adapter à votre installation
 
-set(groot,'defaultFigureVisible','off');  % aucune figure ici
+% --- PATHS ---------------------------------------------------------------
+addpath(genpath('src_anis'));
+addpath(genpath('/Users/anis/Documents/StageInria/Code/OOEIT-main')); % <- adapte
 
-%% -------- Choix patients / slices ---------------------------------------
-% Cible (à reconstruire)
-patient_this = 's0011';
-slice_this   = 301;
+set(groot,'defaultFigureVisible','off');  % pas de figures ici
 
-% Source pour l'initialisation morphologique (si INIT_MODE='morpho')
-patient_prev = 's0011';
-slice_prev   = 310;
+%% -------- Cas -----------------------------------------------------------
+patient_this = 's0011';  slice_this = 301;   % cible
+patient_prev = 's0011';  slice_prev = 310;   % donneur d'organes (contours)
 
-%% ====== Hyperparamètres globaux =========================================
-% Heuristiques "best" par défaut (à affiner selon vos données)
-BEST_MU    = 0.15;     % μ* NOSER (sera re-scalé si 'scaled-median')
-BEST_ALPHA = 1e-5;     % α* (ridge NOSER + régularisation GN)
+%% -------- Hyperparamètres « best » --------------------------------------
+BEST_MU    = 0.05;    % NOSER mu
+BEST_ALPHA = 1e-3;    % alpha L2
 
-% Planning d'itérations
-N_NOSER = 1;           % # pas NOSER   (0 => pas de NOSER)
-N_GN    = 0;           % # itérations GN (0 => pas de GN)
+N_NOSER = 1;          % nb étapes NOSER
+N_GN    = 3;          % nb itérations GN
 
-% Initialisation : 'morpho' (depuis slice_prev) ou 'constant'
-INIT_MODE   = 'morpho';   % 'morpho' | 'constant'
-SOFT_VALUE  = 0.35;       % σ homogène si INIT_MODE='constant' (S/m)
+%% -------- Dossiers d'E/S ------------------------------------------------
+rootThis = fullfile('Outputs',patient_this,sprintf('slice_%03d',slice_this));
+rootPrev = fullfile('Outputs',patient_prev,sprintf('slice_%03d',slice_prev));
 
-%% -------- Arborescence E/S ----------------------------------------------
-rootThis = fullfile('Outputs',patient_this,sprintf('slice_%03d',slice_this));              % pack/mesh forward
-invRoot  = fullfile(rootThis,'inverse',sprintf('prev_%s_%03d',patient_prev,slice_prev));   % sous-dossier dédié
-plotDir  = fullfile(invRoot,'plots_inverse');
-iterDir  = fullfile(plotDir,'iterations');
+if ~exist(rootThis,'dir'), mkdir(rootThis); end
 
+packFile = fullfile(rootThis,'eit_pack.mat');    % pack FORWARD existant (mesh riche)
+meshFwd  = fullfile(rootThis,'mesh',sprintf('mesh_slice%03d.mat',slice_this)); % mesh riche cible (contient contour)
+meshPrev = fullfile(rootPrev,'mesh',sprintf('mesh_slice%03d.mat',slice_prev)); % mesh donneur (contient shapes)
+
+assert(isfile(packFile), 'Pack forward cible manquant: %s', packFile);
+assert(isfile(meshFwd),  'Mesh forward cible manquant: %s', meshFwd);
+assert(isfile(meshPrev), 'Mesh donneur manquant: %s', meshPrev);
+
+% Répertoires inverse
+invRoot = fullfile(rootThis,'inverse',sprintf('prev_%s_%03d',patient_prev,slice_prev));
+plotDir = fullfile(invRoot,'plots_inverse');
+iterDir = fullfile(plotDir,'iterations');
 if ~exist(invRoot,'dir'), mkdir(invRoot); end
 if ~exist(plotDir,'dir'), mkdir(plotDir); end
 if ~exist(iterDir,'dir'), mkdir(iterDir); end
 
-packFile = fullfile(rootThis,'eit_pack.mat');     % pack forward (indispensable)
-recFile  = fullfile(invRoot,'reconstruction_inverse.mat');
+recFile = fullfile(invRoot,'reconstruction_inverse.mat');
 
-assert(isfile(packFile), 'Pack forward introuvable: %s', packFile);
-S = load(packFile);  % charge g,H,E,params, Vmat/Imeas/Ipat, sigma_tri, domain, etc.
-
-%% ----- Clip dynamique depuis les conductivités (robuste) -----------------
-% Borne des σ dans un intervalle un peu plus large que [min(cond), max(cond)]
+%% -------- Clip dynamique depuis pack -----------------------------------
+S = load(packFile);
 vals = struct2array(S.params.cond);
-lo = max(1e-3, min(vals)); 
-hi = max(vals);
-span = hi - lo;
-lo = max(1e-3, lo - 0.02*span);
-hi = hi + 0.02*span;
-CLIP = [lo, hi];
+lo = max(1e-3, min(vals)); hi = max(vals); span = hi - lo;
+CLIP = [max(1e-3, lo-0.02*span), hi+0.02*span];
 
-fprintf('[INVERSE] target=(%s,%03d) | prev=(%s,%03d)\n', ...
-        patient_this, slice_this, patient_prev, slice_prev);
-fprintf('[INVERSE] Using fixed best: mu=%.6g, alpha=%.6g | clip=[%.4g, %.4g]\n', ...
+%% -------- Options solveur -----------------------------------------------
+opts = struct();
+
+% --- Re-maillage inverse (contour seul) + transplantation d'organes prev ---
+opts.inverse_from_prev_organs = true;     % indicateur (ok si non lu par simulate)
+opts.inv_Hmax  = 5;                       % mm
+opts.inv_Hgrad = 1.3;
+opts.rebuild_inverse_mesh = false;
+
+% --- Warp contours prev->this (TPS) ---
+opts.doWarp = true;
+opts.tps    = struct('enable',true,'lambda',1e-3);
+
+% --- Init MORPHOLOGIQUE (pas constante !) ---
+opts.init = struct( ...
+    'constant_enable', false, ...   % <<< IMPORTANT: désactive init homogène
+    'discrete',        true, ...
+    'knn_k',           11, ...
+    'clean_iters',     3, ...
+    'band_mm',         3.0, ...
+    'island_min_area_mm2', 200, ...
+    'smooth_iters',    0, ...
+    'smooth_lambda',   0, ...
+    'calib_enable',    false, ...
+    'calib_clip',      [1 1], ...
+    'noser_warmstart', struct('enable',false) );
+
+% --- Paramétrisation / régularisation ---
+opts.param_by   = 'node';                   % 'node' ou 'tri'
+opts.reg_alpha  = (N_GN>0) * BEST_ALPHA;    % L2 sur θ si GN>0
+opts.reg_on     = 'theta';
+
+% --- Données / bruit ---
+opts.clip       = CLIP;
+opts.constNoise = 3e-5;
+opts.relNoise   = 1.2e-2;
+
+% --- Itérations ---
+opts.iters_per_stage = max(0, N_GN);
+opts.noser_only = struct( ...
+    'enable',       N_NOSER>0, ...
+    'iters',        max(0, N_NOSER), ...
+    'lambda',       BEST_MU, ...
+    'lambda_mode',  'scaled-median', ...
+    'use_diag',     true, ...
+    'max_rel_step', 0.20, ...
+    'linesearch',   false, ...
+    'alpha_l2',     BEST_ALPHA );
+
+% --- Snapshots ---
+opts.snapshots_enable = true;
+opts.cleanIterDir     = true;
+
+fprintf('[INVERSE] target=(%s,%03d) | prev=(%s,%03d)\n', patient_this, slice_this, patient_prev, slice_prev);
+fprintf('[INVERSE] Using tuned best: mu=%.6g, alpha=%.6g | clip=[%.4g, %.4g]\n', ...
         BEST_MU, BEST_ALPHA, CLIP(1), CLIP(2));
 fprintf('[INVERSE] Plan: NOSER=%d step(s), GN=%d it(s)\n', N_NOSER, N_GN);
 fprintf('[INVERSE] Output dir: %s\n', invRoot);
 
-%% ====== Options reconstruction (passées à simulate_inverse_slice) =======
-opts = struct();
-opts.clip             = CLIP;     % bornes σ nodale
-opts.doWarp           = true;     % warp contours (init morpho)
-opts.cleanIterDir     = true;     % purge snapshots avant relance
-opts.constNoise       = 3e-5;     % bruit additif (Gamma^-1)
-opts.relNoise         = 1.2e-2;   % bruit relatif   (Gamma^-1)
-opts.snapshots_enable = true;     % sauver iter_###.mat à chaque étape
-
-% Paramétrisation / régularisation
-opts.param_by    = 'tri';     % 'tri' (θ=σ par triangle, recommandé) | 'node' (σ nodale, debug)
-opts.reg_on      = 'theta';   % 'theta' => α||θ||^2   |  'sigma' => α||σ||^2 (σ=Φθ)
-opts.debug_fdJ   = false;     % true => check Jacobien chaîne Φ vs FD
-opts.debug_fdJ_q = 8;         % nb colonnes FD si debug_fdJ
-
-% ---- Initialisation
-switch lower(INIT_MODE)
-    case 'constant'
-        % Init homogène : σ(x) = SOFT_VALUE
-        opts.init = struct( ...
-            'constant_enable', true, ...
-            'soft_value',      SOFT_VALUE, ...
-            'discrete',        true, ...          % sans effet ici
-            'knn_k',           3, ...
-            'quant',           struct('clean_iters',2,'centers',[]), ...
-            'auto_blend',      false, ...
-            'blend_max',       0, ...
-            'blend_homog',     0, ...
-            'smooth_iters',    0, ...
-            'smooth_lambda',   0, ...
-            'calib_enable',    false, ...
-            'calib_clip',      [1 1], ...
-            'noser_warmstart', struct('enable',false) );
-    otherwise
-        % Init morpho discrète depuis slice_prev (k-NN + majorité, etc.)
-        opts.init = struct( ...
-            'constant_enable', false, ...
-            'discrete',true,'knn_k',3, ...
-            'quant',struct('clean_iters',2,'centers',[]), ...
-            'auto_blend',false,'blend_max',0,'blend_homog',0, ...
-            'smooth_iters',0,'smooth_lambda',0, ...
-            'calib_enable',false,'calib_clip',[1 1], ...
-            'noser_warmstart',struct('enable',false) );
-end
-
-% ---- NOSER multi-steps
-opts.noser_only = struct( ...
-    'enable',       N_NOSER>0, ...
-    'iters',        max(0,N_NOSER), ...
-    'lambda',       BEST_MU, ...
-    'lambda_mode',  'scaled-median', ...   % robuste à l'échelle du problème
-    'use_diag',     true, ...
-    'max_rel_step', 0.20, ...
-    'linesearch',   false, ...
-    'alpha_l2',     BEST_ALPHA);           % ridge léger au NOSER
-
-% ---- GN (sur θ, avec éventuelle régularisation L2)
-opts.iters_per_stage = max(0,N_GN);
-opts.reg_alpha       = (N_GN>0) * BEST_ALPHA;
-
-%% ====== Lancement du pipeline (NOSER puis GN) ===========================
-% simulate_inverse_slice orchestre tout (lecture pack/mesh, init, Φ, FEM, etc.)
+%% -------- Lancement -----------------------------------------------------
 rec = simulate_inverse_slice(patient_this, slice_this, patient_prev, slice_prev, opts, iterDir);
 
-%% ====== Sauvegarde finale ===============================================
+%% -------- Sauvegarde ----------------------------------------------------
 save(recFile, '-struct', 'rec');
-
-% Logging simple
-mis = NaN;
-if isfield(rec,'misfit') && ~isempty(rec.misfit), mis = rec.misfit; end
-fprintf('\n[INVERSE] Reco terminée. Misfit relatif = %.6g\nFichier: %s\n', mis, recFile);
+mis = NaN; if isfield(rec,'misfit') && ~isempty(rec.misfit), mis = rec.misfit; end
+fprintf('\n[INVERSE] Reconstruction done. Relative misfit = %.6g\nFile: %s\n', mis, recFile);
