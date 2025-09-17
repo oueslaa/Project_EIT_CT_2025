@@ -21,7 +21,7 @@ patient_prev = 's0011';  slice_prev = 310;   % donneur d'organes (contours)
 
 %% -------- Hyperparamètres « best » --------------------------------------
 BEST_MU    = 0.05;    % NOSER mu
-BEST_ALPHA = 1e-3;    % alpha L2
+BEST_ALPHA = 1e-3;    % alpha L2  -> du H_1 au lieu de L2 !
 
 N_NOSER = 1;          % nb étapes NOSER
 N_GN    = 3;          % nb itérations GN

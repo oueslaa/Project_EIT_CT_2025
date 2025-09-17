@@ -1,0 +1,56 @@
+
+# macOS / Python / Jupyter / MATLAB
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env/
+.ipynb_checkpoints/
+*.asv
+*.mex*
+*.autosave
+
+# Build / temp
+build/
+dist/
+*.log
+tmp/
+temp/
+cache/
+
+# GROS DOSSIERS A NE PAS VERSIONNER (datasets, résultats, modèles)
+Data_set/
+datasets/
+data/
+raw/
+processed/
+Outputs/
+Output/
+Results/
+results/
+checkpoints/
+models/
+weights/
+MeshData/
+segmentation_slices/
+
+# GROS FORMATS A NE PAS VERSIONNER
+*.nii
+*.nii.gz
+*.mat
+*.zip
+*.tar
+*.7z
+*.gz
+*.bz2
+*.xz
+*.npy
+*.npz
+*.stl
+*.ply
+*.vtk
+*.mha
+*.mhd
+*.nrrd

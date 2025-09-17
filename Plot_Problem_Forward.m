@@ -1,12 +1,11 @@
-
 % ============================
-% File: Plot_Problem_Forward.m
+% File: Plot_Problem_Foward.m
 % ============================
 % VISUALISATION DU PROBLÈME FORWARD EIT
 % -------------------------------------------------------------------------
 % BUT
 %   Afficher TOUTES les figures utiles à partir des fichiers produits par
-%   Problem_Forward.m : CT brut, contours/mesh, électrodes, champs σ, |E|,
+%   Problem_Foward.m : CT brut, contours/mesh, électrodes, champs σ, |E|,
 %   potentiels, métriques (SNR, réciprocité), etc.
 %
 % ENTRÉES (fichiers attendus dans Outputs/<patient>/slice_xxx/)
@@ -20,15 +19,13 @@
 %   - Dossier plots_forward/ avec PNG haute définition (si SAVE_PNG==true)
 %
 % REMARQUES / PIÈGES
-%   - Ce script AFFICHE les figures (contrairement à Problem_Forward).
+%   - Ce script AFFICHE les figures (contrairement à Problem_Foward).
 %   - displayMode:
 %       * 'radiological'  : convention DICOM (X inversé visuellement)
 %       * 'neurological'  : X normal
 %   - Les figures utilisent des garde-fous (try/catch) pour ne pas interrompre
 %     tout le script si un plot échoue.
 % -------------------------------------------------------------------------
-
-% (Laisse ce fichier en script; toutes les fonctions locales sont à la fin)
 
 clear; close all; clc;
 addpath('src', genpath('src'));
@@ -72,6 +69,10 @@ viz  = VZ.viz_config;
 meta = SRC.meta;
 displayMode = viz.displayMode;
 
+%% 0) Helpers d'orientation / petites utilitaires --------------------------
+apply_display = @(ax,mode) set(ax,'XDir', ternary(strcmpi(mode,'radiological'),'reverse','normal'));
+function out = ternary(cond,a,b); if cond, out=a; else, out=b; end; end
+
 %% 1) CT brut (robuste) ----------------------------------------------------
 try
     [CT, info] = read_nifti3D(meta.ct_file);
@@ -80,7 +81,7 @@ try
     fh = figure('Color','w','Name','CT brut','NumberTitle','off');
     imagesc(img); axis image off; colormap(gray);
     title(sprintf('CT slice z=%d', meta.z_slice));
-    apply_display(gca, displayMode);
+    if strcmpi(displayMode,'radiological'), set(gca,'XDir','reverse'); end
     if SAVE_PNG
         exportgraphics(fh, fullfile(plotDir,'ct_brut.png'), 'Resolution', DPI);
     end
@@ -160,7 +161,7 @@ try
     end
     cb=colorbar; ylabel(cb,'\sigma (S/m)');
     title('mesh + electrodes + \sigma forward'); set(gca,'XTick',[],'YTick',[]);
-    apply_display(gca, displayMode);
+    if strcmpi(displayMode,'radiological'), set(gca,'XDir','reverse'); end
     if SAVE_PNG
         exportgraphics(fh, fullfile(plotDir,'mesh_electrodes_sigma_forward.png'), 'Resolution', DPI);
     end
@@ -168,47 +169,29 @@ catch ME
     warning('Plot sigma(forward) impossible (%s).', ME.message);
 end
 
-%% 7) Tensions aux électrodes (heatmap + profil ) -------------------------
+%% 7) Tensions aux électrodes (heatmap + profil) --------------------------
 try
-    [Vmat, Ne, K] = ensure_Vmat(S);
+    Vmat = []; Vraw=[];
+    if isfield(S,'Vmat') && ~isempty(S.Vmat), Vmat = S.Vmat; end
+    if isempty(Vmat)
+        if isfield(S,'Imeas'), Vraw = S.Imeas; else, Vraw = S.Imeas_clean; end
+        Ne = S.params.Ne; K = numel(Vraw)/Ne;
+        Vmat = reshape(Vraw, Ne, K);
+    end
 
-    % --- unité lisible ---
     vmax = max(abs(Vmat(:)));
-    if vmax < 1e-2, scale = 1e3; unit = 'mV'; else, scale = 1; unit = 'V'; end
+    if vmax < 1e-2, scale=1e3; unit='mV'; else, scale=1; unit='V'; end
 
-    % --- Heatmap (Ne x K) ---
     fh = figure('Color','w','Name','Tensions aux electrodes (heatmap)','NumberTitle','off');
     imagesc(scale*Vmat); axis tight; set(gca,'YDir','normal');
-    xlabel('Motif d''injection (k)'); ylabel('Electrode (i)');
-    cb = colorbar; ylabel(cb, ['Tension (' unit ')']);
-    title(sprintf('Tensions aux electrodes (Ne=%d, K=%d)', Ne, K));
-    if SAVE_PNG
-        exportgraphics(fh, fullfile(plotDir,'electrode_voltages_heatmap.png'), 'Resolution', DPI);
-    end
+    xlabel('Motif d''injection'); ylabel('Electrode'); cb=colorbar; ylabel(cb,['Tension (' unit ')']);
+    title('Tensions aux electrodes (forward)');
+    if SAVE_PNG, exportgraphics(fh, fullfile(plotDir,'electrode_voltages_heatmap.png'), 'Resolution', DPI); end
 
-    % --- Profil sur 1..Ne*K ---
-    Vcat = Vmat(:);
-    x = 1:numel(Vcat);
-
-    fh2 = figure('Color','w','Name','Profil tensions','NumberTitle','off');
-    plot(x, scale*Vcat, '-'); grid on; xlim([1 numel(Vcat)]);
-    xlabel(sprintf('Électrodes (1..%d)  [Ne=%d, K=%d]', Ne*K, Ne, K));
-    ylabel(sprintf('Tension (%s)', unit));
-    title('Profil des tensions aux électrodes');
-
-    % séparateurs à chaque frontière de motif
-    hold on;
-    if K > 1
-        xs = (1:K-1)*Ne + 0.5;
-        for s = xs
-            xline(s, ':', 'HandleVisibility','off');
-        end
-    end
-    if K <= 32, xticks(0:Ne:Ne*K); end
-
-    if SAVE_PNG
-        exportgraphics(fh2, fullfile(plotDir,'electrode_voltages_profile.png'), 'Resolution', DPI);
-    end
+    fh2 = figure('Color','w','Name','Profil tensions - motif #1','NumberTitle','off');
+    plot(1:size(Vmat,1), scale*Vmat(:,1), '-o'); grid on; xlim([1 size(Vmat,1)]); xticks(1:size(Vmat,1));
+    xlabel('Electrode'); ylabel(['Tension (' unit ')']); title('Profil des tensions — motif #1');
+    if SAVE_PNG, exportgraphics(fh2, fullfile(plotDir,'electrode_voltages_profile_motif01.png'), 'Resolution', DPI); end
 catch ME
     warning('Plot des tensions aux electrodes impossible (%s).', ME.message);
 end
@@ -220,7 +203,7 @@ try
         good = cellfun(@(u) ~isempty(u) && all(isfinite(u)), Uc_all);
         Uc = Uc_all(good);
         if ~isempty(Uc)
-            Kall = numel(Uc); kk = min(Kall,16);
+            K = numel(Uc); kk = min(K,16);
 
             % caxis global robuste via percentiles (évite outliers)
             allvals = cell2mat(cellfun(@(u) u(:), Uc(1:kk), 'UniformOutput', false));
@@ -281,56 +264,35 @@ catch ME
     warning('Quiver E impossible (%s).', ME.message);
 end
 
-%% 11) Motifs de courant injecté (I) — heatmap + profils ------------------
+%% 11) Motifs de courant injecté (I) + somme nulle -------------------------
 try
-    I = ensure_I(S);
-    Ne = size(I,1); K  = size(I,2);
-
-    % --- vérif somme nulle par motif ---
-    sumI = sum(I, 1);
+    if isfield(S,'Ipat') && ~isempty(S.Ipat), I = S.Ipat; else, I = EITSim.buildTrigPattern(S.params.Ne, S.params.I_amp); end
+    sumI = sum(I,1);
+    fh = figure('Color','w','Name','Courants injectés (1er motif)','NumberTitle','off');
+    plot(1:S.params.Ne, I(:,1), '-o'); grid on; xlim([1 S.params.Ne]); xticks(1:S.params.Ne);
+    xlabel('Électrode'); ylabel('Courant (A)'); title('Motif d''injection #1');
+    if SAVE_PNG, exportgraphics(fh, fullfile(plotDir, 'currents_motif01.png'), 'Resolution', DPI); end
     fprintf('Vérif somme(I) par motif (max abs): %.3e A\n', max(abs(sumI)));
-
-    % --- Heatmap ---
-    fh = figure('Color','w','Name','Courants injectés — heatmap','NumberTitle','off');
-    imagesc(I); axis tight; set(gca,'YDir','normal');
-    xlabel('Motif d''injection (k)'); ylabel('Électrode (i)');
-    cb = colorbar; ylabel(cb, 'Courant (A)');
-    title(sprintf('Motifs de courant injecté (Ne=%d, K=%d, I_{amp}=%.3g A)', Ne, K, S.params.I_amp));
-    if SAVE_PNG
-        exportgraphics(fh, fullfile(plotDir, 'currents_heatmap.png'), 'Resolution', DPI);
-    end
-
-    % --- Profil sur 1..Ne*K ---
-    Icat = I(:);
-    x = 1:numel(Icat);
-
-    fh2 = figure('Color','w','Name','Courants injectés','NumberTitle','off');
-    plot(x, Icat, '-'); grid on; xlim([1 numel(Icat)]);
-    xlabel(sprintf('Électrodes (1..%d)  [Ne=%d, K=%d]', Ne*K, Ne, K));
-    ylabel('Courant (A)');
-    title('Courants injectés');
-
-    % Séparateurs entre motifs
-    hold on;
-    if K > 1
-        xs = (1:K-1)*Ne + 0.5;  % entre deux blocs d'électrodes
-        for s = xs
-            xline(s, ':', 'HandleVisibility','off');
-        end
-    end
-    if K <= 32, xticks(0:Ne:Ne*K); end
-
-    if SAVE_PNG
-        exportgraphics(fh2, fullfile(plotDir, 'currents_profile.png'), 'Resolution', DPI);
-    end
 catch ME
     warning('Plot motifs de courant impossible (%s).', ME.message);
 end
 
 %% 12) Réciprocité (||I^T V - (I^T V)^T||) --------------------------------
 try
-    [Vmat, ~, ~] = ensure_Vmat(S);
-    I = ensure_I(S);
+    % Vmat
+    if isfield(S,'Vmat') && ~isempty(S.Vmat)
+        Vmat = S.Vmat;
+        if size(Vmat,1) ~= S.params.Ne, Vmat = Vmat.'; end % force Ne x K
+    else
+        Vraw = S.Imeas; Ne = S.params.Ne;
+        K = floor(numel(Vraw)/Ne);
+        Vmat = reshape(Vraw(1:Ne*K), Ne, K);
+    end
+    % I
+    if isfield(S,'Ipat') && ~isempty(S.Ipat), I = S.Ipat;
+    else, I = EITSim.buildTrigPattern(S.params.Ne, S.params.I_amp);
+    end
+    if size(I,1) ~= S.params.Ne, I = I.'; end % force Ne x K
 
     % Aligne sur le plus petit K commun
     Kc = min(size(Vmat,2), size(I,2));
@@ -350,7 +312,23 @@ catch ME
     warning('Test de réciprocité impossible (%s).', ME.message);
 end
 
-%% 13) Qualité de mesh: aires et angle minimal -----------------------------
+%% 13) Profils tension pour quelques motifs --------------------------------
+try
+    Ne = S.params.Ne; K = size(Vmat,2);
+    idxs = unique(max(1, round([1, K/4, K/2])));
+    for ii = 1:numel(idxs)
+        k = idxs(ii);
+        fh = figure('Color','w','Name',sprintf('Profil tension motif #%d',k),'NumberTitle','off');
+        plot(1:Ne, Vmat(:,k), '-o'); grid on; xlim([1 Ne]); xticks(1:Ne);
+        xlabel('Électrode'); ylabel('Tension (V)'); 
+        title(sprintf('Profil tensions — motif #%d', k));
+        if SAVE_PNG, exportgraphics(fh, fullfile(plotDir, sprintf('electrode_profile_motif%02d.png',k)), 'Resolution', DPI); end
+    end
+catch ME
+    warning('Profils tension par motif impossibles (%s).', ME.message);
+end
+
+%% 14) Qualité de mesh: aires et angle minimal -----------------------------
 try
     P1 = S.g(S.H(:,1),:); P2 = S.g(S.H(:,2),:); P3 = S.g(S.H(:,3),:);
     A  = 0.5*abs( P1(:,1).*(P2(:,2)-P3(:,2)) + P2(:,1).*(P3(:,2)-P1(:,2)) + P3(:,1).*(P1(:,2)-P2(:,2)) );
@@ -359,7 +337,7 @@ try
     if SAVE_PNG, exportgraphics(fh, fullfile(plotDir, 'mesh_area_hist.png'), 'Resolution', DPI); end
 
     v1 = P2-P1; v2 = P3-P2; v3 = P1-P3;
-    ang = @(u,v) acosd( max(-1,min(1, sum(u.*v,2)./(sqrt(sum(u.^2,2)).*sqrt(sum(v.^2,2))))) );
+    ang = @(u,v) acosd( max(-1,min(1, sum(u.*v,2)./(sqrt(sum(u.^2,2)).*sqrt(sum(v.^2,2))))));
     a1 = ang(v1,-v3); a2 = ang(v2,-v1); a3 = ang(v3,-v2);
     amin = min([a1 a2 a3],[],2);
     fh = figure('Color','w','Name','Histogramme angle minimal (deg)','NumberTitle','off');
@@ -369,19 +347,17 @@ catch ME
     warning('Qualité de mesh non tracée (%s).', ME.message);
 end
 
-%% 14) Histogramme des conductivités élémentaires --------------------------
+%% 15) Histogramme des conductivités élémentaires --------------------------
 try
-    fh = figure('Color','w','Name','Histogramme \\sigma (par triangle)','NumberTitle','off');
-    histogram(S.sigma_tri, 30); xlabel('\\sigma (S/m)'); ylabel('Comptes'); grid on;
-    if isfield(viz,'sigma_clim') && numel(viz.sigma_clim)==2
-        xlim(viz.sigma_clim);
-    end
+    fh = figure('Color','w','Name','Histogramme \sigma (par triangle)','NumberTitle','off');
+    histogram(S.sigma_tri, 30); xlabel('\sigma (S/m)'); ylabel('Comptes'); grid on;
+    xlim(viz.sigma_clim); 
     if SAVE_PNG, exportgraphics(fh, fullfile(plotDir, 'sigma_hist.png'), 'Resolution', DPI); end
 catch ME
     warning('Histogramme sigma impossible (%s).', ME.message);
 end
 
-%% 15) SNR et distribution du bruit ---------------------------------------
+%% 16) SNR et distribution du bruit ---------------------------------------
 try
     assert(isfield(S,'Imeas_clean') && ~isempty(S.Imeas_clean) && isfield(S,'Imeas') && ~isempty(S.Imeas), ...
         'Imeas_clean/Imeas manquants pour SNR.');
@@ -395,57 +371,39 @@ catch ME
     warning('SNR/bruit non tracés (%s).', ME.message);
 end
 
-% ===================== Helpers locaux (FONCTIONS EN FIN DE SCRIPT) =====================
-
-function out = ternary(cond,a,b)
-    if cond, out = a; else, out = b; end
-end
-
-function apply_display(ax, mode)
-    if strcmpi(mode,'radiological')
-        set(ax,'XDir','reverse');
-    else
-        set(ax,'XDir','normal');
+%% 17) (Optionnel) Carte de sensibilité (||J||) ----------------------------
+DO_SENSI = false;
+if DO_SENSI
+    try
+        eitSim2 = EITSim(S.g, S.H, S.triGroup, S.domain, S.params, S.E, EL.el_centers);
+        [~, J] = eitSim2.forward_with_jacobian(S.sigma_tri); % m x Mt
+        sens = sqrt(sum(abs(J).^2,1)).';                      % Mt x 1
+        fh = figure('Color','w','Name','Sensibilité (||J|| col)','NumberTitle','off'); hold on;
+        patch('Faces',S.H,'Vertices',S.g,'FaceVertexCData',sens,'FaceColor','flat','EdgeColor','none');
+        axis equal tight; colorbar; title('||J|| par triangle');
+        apply_display(gca, displayMode);
+        if SAVE_PNG, exportgraphics(fh, fullfile(plotDir, 'sensitivity_normJ.png'), 'Resolution', DPI); end
+    catch ME
+        warning('Carte de sensibilité impossible (%s).', ME.message);
     end
 end
 
-function [Vmat, Ne, K] = ensure_Vmat(S)
-    % Garantit Vmat de taille Ne x K à partir de S (pack forward)
-    if isfield(S,'Vmat') && ~isempty(S.Vmat)
-        Vmat = S.Vmat;
-        if size(Vmat,1) ~= S.params.Ne, Vmat = Vmat.'; end
-    else
-        Vraw = [];
-        if isfield(S,'Imeas') && ~isempty(S.Imeas), Vraw = S.Imeas;
-        elseif isfield(S,'Imeas_clean') && ~isempty(S.Imeas_clean), Vraw = S.Imeas_clean;
-        else, error('Aucune mesure disponible pour construire Vmat.');
-        end
-        Ne = S.params.Ne; K = floor(numel(Vraw)/Ne);
-        Vmat = reshape(Vraw(1:Ne*K), Ne, K);
-        return;
-    end
-    Ne = size(Vmat,1); K = size(Vmat,2);
-end
-
-function I = ensure_I(S)
-    if isfield(S,'Ipat') && ~isempty(S.Ipat)
-        I = S.Ipat;
-    else
-        I = EITSim.buildTrigPattern(S.params.Ne, S.params.I_amp);
-    end
-    if size(I,1) ~= S.params.Ne, I = I.'; end
-end
+% ===================== Helpers locaux (en fin de fichier) =================
 
 function Cfaces = ensure_face_cdata(S)
-    Mt = size(S.H,1);
-    C = S.sigma_tri;
-    if numel(C) == Mt
-        Cfaces = C(:);
-    elseif numel(C) == size(S.g,1)
-        C = C(:);
-        Cfaces = (C(S.H(:,1)) + C(S.H(:,2)) + C(S.H(:,3))) / 3;
-    else
-        error('Taille de sigma_tri (%d) incompatible avec #faces (%d) et #noeuds (%d).',...
-              numel(C), Mt, size(S.g,1));
-    end
+% ENSURE_FACE_CDATA
+% Garantit une CData par triangle pour patch(...,'FaceColor','flat').
+% - Si S.sigma_tri est déjà Mt x 1 => retourne tel quel.
+% - Si CData nodale (#noeuds)      => moyenne nodale par triangle.
+Mt = size(S.H,1);
+C = S.sigma_tri;
+if numel(C) == Mt
+    Cfaces = C(:);
+elseif numel(C) == size(S.g,1)
+    C = C(:);
+    Cfaces = (C(S.H(:,1)) + C(S.H(:,2)) + C(S.H(:,3))) / 3;
+else
+    error('Taille de sigma_tri (%d) incompatible avec #faces (%d) et #noeuds (%d).',...
+          numel(C), Mt, size(S.g,1));
+end
 end
