@@ -28,7 +28,7 @@
 % -------------------------------------------------------------------------
 
 clear; close all; clc;
-addpath('src', genpath('src'));
+addpath(genpath('src_anis'));
 
 % --- Ici on veut VOIR les figures ----------------------------------------
 set(groot,'defaultFigureVisible','on');
