@@ -41,7 +41,7 @@
 clear; close all; clc;
 
 % --- 0) PATHS & MODE SILENCIEUX ------------------------------------------
-addpath('src', genpath('src'));  % utilitaires du dépôt (FFT lissage, NIfTI, mesh, etc.)
+addpath(genpath('src_anis')); % utilitaires du dépôt (FFT lissage, NIfTI, mesh, etc.)
 addpath(genpath('/Users/anis/Documents/StageInria/Code/OOEIT-main')); % OOEIT
 
 % Aucune figure ne doit s'afficher dans ce script
