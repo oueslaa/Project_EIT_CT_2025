@@ -5,16 +5,37 @@
 
 ---
 
+## 📥 Téléchargements
+
+Pour tester rapidement la toolbox sans avoir à préparer tes propres données :
+
+* **Data_set.zip** – petit dataset CT + segmentations d’exemple
+* **Outputs.zip** – sorties complètes générées par `Batch.m` sur ce dataset (maillages, packs forward, PNG)
+
+[⬇️ Télécharger Data_set.zip et Outputs.zip](https://filesender.renater.fr/?s=download&token=3ee6e5b5-e57e-4e11-82ef-5acff3fd2a3d)
+
+Décompresse les archives dans la racine du projet, tu obtiendras :
+
+```
+PROJECT_EIT_CT_2025-MAIN/
+├─ Data_set/       # issu de Data_set.zip
+└─ Outputs/        # issu de Outputs.zip
+```
+
+Ensuite, lance directement les scripts de plotting pour voir les résultats sans recalculer.
+
+---
+
 ## 📁 Structure du dépôt
 
 ```
 OOEIT-main/                          # (optionnel) backend EIT FEM (OOEIT)
 PROJECT_EIT_CT_2025-MAIN/
 ├─ BatchLogs/                        # logs & snapshots d’itérations
-├─ Data_set/                         # CT/segmentations par patient
+├─ Data_set/                         # CT/segmentations par patient (exemple fourni)
 ├─ meta/                             # configs (conductivités, mappings, etc.)
 ├─ src_anis/                         # (ce dossier) tout le pipeline MATLAB
-├─ Outputs/                          # sorties par patient/slice
+├─ Outputs/                          # sorties par patient/slice (exemple fourni)
 ├─ Batch.m                           # exécution batch forward + plots
 ├─ Plot_Problem_Forward_fn.m         # helpers plot forward
 ├─ Plot_Problem_Forward.m            # démo/driver forward
